@@ -1179,15 +1179,11 @@ class VoiceListener(threading.Thread):
         except Exception as e:
             debug_log(f"failed to set face state to THINKING: {e}", "voice")
 
-        # Import reply engine
-        from ..reply.engine import run_reply_engine
+        # Send to Hermes Agent via the bridge
+        from ..bridge import call_hermes, append_voice_entry
 
-        # Process the query (keep thinking tune playing during processing)
         try:
-            reply = run_reply_engine(
-                self.db, self.cfg, None, query, self.dialogue_memory,
-                language=self._last_detected_language,
-            )
+            reply = call_hermes(query)
         except Exception as e:
             # Log the error visibly - this should never happen silently
             print(f"\n  ❌ Reply engine error: {e}", flush=True)
@@ -1197,6 +1193,13 @@ class VoiceListener(threading.Thread):
             if self.tts and self.tts.enabled:
                 self.tts.speak("Sorry, I encountered an error processing your request.")
             return
+
+        # Log the voice exchange to daily notes
+        if reply:
+            try:
+                append_voice_entry(query, reply)
+            except Exception as log_err:
+                debug_log(f"voice logger error: {log_err}", "voice")
 
         # Handle TTS with proper callbacks
         if reply and self.tts and self.tts.enabled:

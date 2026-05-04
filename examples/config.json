@@ -22,8 +22,8 @@
     "com.jetbrains.intellij"
   ],
   "tts_enabled": true,
-  "tts_engine": "piper",
-  "tts_voice": null,
+  "tts_engine": "edge",
+  "tts_voice": "en-US-AriaNeural",
   "tts_rate": 200,
   "tts_piper_model_path": null,
   "tts_piper_speaker": null,

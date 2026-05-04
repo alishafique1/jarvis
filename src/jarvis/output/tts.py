@@ -964,6 +964,186 @@ class PiperTTS:
         return self._last_spoken_text
 
 
+class EdgeTTS:
+    """TTS implementation using Microsoft Edge's free online TTS (no API key needed).
+
+    Uses edge-tts Python package to synthesize speech via Microsoft's Edge browser TTS
+    service. Supports a wide range of voices including en-US-AriaNeural (female, natural).
+    Duration is estimated from word count (~150 WPM) since streaming audio doesn't give
+    exact sample counts upfront.
+    """
+
+    VOICE_MAP = {
+        # Female voices (recommended for Zenu persona)
+        "en-US-AriaNeural":    "en-US-AriaNeural",
+        "en-US-NovaNeural":    "en-US-NovaNeural",
+        "en-US-JennyNeural":   "en-US-JennyNeural",
+        "en-US-SaraNeural":    "en-US-SaraNeural",
+        "en-GB-SoniaNeural":   "en-GB-SoniaNeural",
+        # Male voices
+        "en-US-GuyNeural":     "en-US-GuyNeural",
+        "en-GB-RyanNeural":    "en-GB-RyanNeural",
+    }
+
+    DEFAULT_VOICE = "en-US-AriaNeural"
+
+    def __init__(
+        self,
+        enabled: bool = True,
+        voice: Optional[str] = None,
+        rate: Optional[int] = None,   # e.g. +0%, -10%
+        pitch: Optional[int] = None,   # e.g. +0Hz, -5Hz
+    ) -> None:
+        self.enabled = enabled
+        self.voice = voice or self.DEFAULT_VOICE
+        self.rate = rate   # e.g. "+0%" or "-10%"
+        self.pitch = pitch
+
+        self._q: queue.Queue[str] = queue.Queue()
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._is_speaking = threading.Event()
+        self._last_spoken_text = ""
+        self._completion_callback: Optional[Callable[[], None]] = None
+        self._duration_callback: Optional[Callable[[float], None]] = None
+        self._should_interrupt = threading.Event()
+
+        self._initialized = False
+        self._init_error: Optional[str] = None
+
+    def _ensure_initialized(self) -> bool:
+        if self._initialized:
+            return True
+        try:
+            import edge_tts
+            self._edge_tts = edge_tts
+            self._initialized = True
+            return True
+        except ImportError as e:
+            self._init_error = f"edge-tts not installed: {e}. Run: pip install edge-tts"
+            return False
+
+    def speak(
+        self,
+        text: str,
+        completion_callback: Optional[Callable[[], None]] = None,
+        duration_callback: Optional[Callable[[float], None]] = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        if not text or not text.strip():
+            return
+
+        self._completion_callback = completion_callback
+        self._duration_callback = duration_callback
+        self._q.put(text)
+
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(target=self._run_loop, daemon=True)
+            self._thread.start()
+
+    def _build_edge_opts(self) -> str:
+        opts = []
+        if self.rate:
+            opts.append(f"Rate={self.rate}")
+        if self.pitch:
+            opts.append(f"Pitch={self.pitch}")
+        return ";".join(opts) if opts else None
+
+    def _estimate_duration(self, text: str) -> float:
+        # ~150 words per minute average
+        word_count = len(text.split())
+        return (word_count / 150) * 60
+
+    def _run_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                text = self._q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            self._is_speaking.set()
+            self._last_spoken_text = text
+            self._should_interrupt.clear()
+
+            try:
+                self._speak_once(text)
+            except Exception as e:
+                print(f"  Edge TTS error: {e}", flush=True)
+
+            self._is_speaking.clear()
+
+            if self._completion_callback:
+                try:
+                    self._completion_callback()
+                except Exception:
+                    pass
+
+    def _speak_once(self, text: str) -> None:
+        if not self._ensure_initialized():
+            if self._init_error:
+                print(f"  {self._init_error}", flush=True)
+            return
+
+        import asyncio
+
+        async def _synthesize():
+            voice = self.VOICE_MAP.get(self.voice, self.DEFAULT_VOICE)
+            opts = self._build_edge_opts()
+
+            Communicate = self._edge_tts.Communicate
+            submaker = self._edge_tts.SubMaker()
+
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+                tmp_path = tmp.name
+
+            async def write_audio(chunks):
+                with open(tmp_path, "wb") as f:
+                    async for chunk in chunks:
+                        if self._should_interrupt.is_set():
+                            break
+                        f.write(chunk)
+
+            try:
+                communicate = Communicate(text, voice)
+                if opts:
+                    communicate._opts = opts
+                await write_audio(communicate.stream())
+            finally:
+                if not self._should_interrupt.is_set():
+                    # Play the file
+                    self._play_file(tmp_path)
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+    def _play_file(self, path: str) -> None:
+        try:
+            import subprocess
+            # Use mpv or afplay on macOS
+            subprocess.run(
+                ["afplay" if sys.platform == "darwin" else "mpv", "--no-video", path],
+                check=True,
+                capture_output=True,
+            )
+        except Exception as e:
+            debug_log(f"Edge TTS playback error: {e}", "tts")
+
+    def stop(self) -> None:
+        self._should_interrupt.set()
+        self._q.put("")  # unblock the queue if needed
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2)
+
+    def is_speaking(self) -> bool:
+        return self._is_speaking.is_set()
+
+    def get_last_spoken_text(self) -> str:
+        return self._last_spoken_text
+
+
 def create_tts_engine(
     engine: str = "piper",
     enabled: bool = True,
@@ -997,6 +1177,12 @@ def create_tts_engine(
             audio_prompt_path=audio_prompt_path,
             exaggeration=exaggeration,
             cfg_weight=cfg_weight,
+        )
+    elif engine.lower() == "edge":
+        return EdgeTTS(
+            enabled=enabled,
+            voice=voice,
+            rate=rate,
         )
     else:
         # Default to Piper TTS

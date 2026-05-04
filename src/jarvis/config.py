@@ -593,10 +593,13 @@ def load_settings() -> Settings:
     active_profiles = _ensure_list(merged.get("active_profiles"))
     tts_enabled = bool(merged.get("tts_enabled", True))
     tts_engine = str(merged.get("tts_engine", "piper")).lower()
-    if tts_engine not in ("piper", "chatterbox"):
+    if tts_engine not in ("piper", "chatterbox", "edge"):
         tts_engine = "piper"  # Default to piper if invalid value
     tts_voice_val = merged.get("tts_voice")
     tts_voice = None if tts_voice_val in (None, "", "null") else str(tts_voice_val)
+    # Default to AriaNeural when using Edge TTS
+    if tts_engine == "edge" and tts_voice is None:
+        tts_voice = "en-US-AriaNeural"
     tts_rate_val = merged.get("tts_rate")
     try:
         tts_rate = None if tts_rate_val in (None, "", "null") else int(tts_rate_val)
